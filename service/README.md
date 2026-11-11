@@ -70,7 +70,8 @@ cache). A power loss can lose at most the last `FSYNC_MS` of writes. Use
 
 ```bash
 make test             # unit + property tests (aggregates are a function of the event set)
-make load             # 5k devices, 50k ev/s burst, offline replay; alarm latency
+make load             # 5k devices, 50k ev/s burst, offline replay; alarm latency;
+                      # occupancy + health vs a recomputed ground truth (needs a fresh DATA_DIR)
 make kill-test        # Python generator (adversarial) + kill -9 at 180s
 make kill-test-full   # grader-shaped: 5k devices, 5 min, 2 bursts, offline 60s, kill -9 at 180s
 ```

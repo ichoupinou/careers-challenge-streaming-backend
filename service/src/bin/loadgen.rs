@@ -10,6 +10,9 @@
 //! - alarm latency: POST of a fall → its event on `/alarms/stream`, p50/p95/p99
 //! - alarms on the feed and in `/alarms` vs distinct falls generated
 //! - a device first seen mid-run shows up with no redeploy
+//! - occupancy (1m/5m/1h, every room) and health (1 device in 10) match a
+//!   ground truth recomputed here from every generated event (`--verify 0`
+//!   to skip; it assumes the service started from an empty data dir)
 //!
 //! ```text
 //! cargo run --release --bin loadgen -- --devices 5000 --duration 90 \
@@ -46,6 +49,8 @@ struct Args {
     concurrency: usize,
     /// Second at which a never-seen device starts sending (<0: off).
     new_device_at: f64,
+    /// Compare occupancy and health with the generated ground truth.
+    verify: bool,
 }
 
 impl Args {
@@ -65,6 +70,7 @@ impl Args {
             batch: 50,
             concurrency: 64,
             new_device_at: 5.0,
+            verify: true,
         };
         let raw: Vec<String> = std::env::args().skip(1).collect();
         let mut it = raw.iter();
@@ -91,6 +97,7 @@ impl Args {
                 "--batch" => a.batch = (num()? as usize).max(1),
                 "--concurrency" => a.concurrency = (num()? as usize).max(1),
                 "--new-device-at" => a.new_device_at = num()?,
+                "--verify" => a.verify = num()? != 0.0,
                 _ => return Err(format!("unknown flag {k}\n\n{HELP}")),
             }
         }
@@ -132,7 +139,7 @@ impl Args {
 const HELP: &str = "loadgen [--target URL] [--devices N] [--duration S] [--rate EV/S]
         [--burst-rate EV/S --burst-at S[,S...] --burst-secs S]
         [--offline-frac F --offline-at S --offline-secs S] [--skew S]
-        [--batch N] [--concurrency N] [--new-device-at S (<0 off)]";
+        [--batch N] [--concurrency N] [--new-device-at S (<0 off)] [--verify 1|0]";
 
 /// Same weights as event_generator/generate.py.
 const WEIGHTS: [(&str, u32); 6] =
@@ -260,6 +267,7 @@ async fn main() {
         })
         .collect();
     let offline: Vec<bool> = (0..args.devices).map(|_| fastrand::f64() < args.offline_frac).collect();
+    let mut truth = GroundTruth::default();
     let mut new_device = Device { id: "dev_new_mid_run".into(), room: "room_new".into(), seq: 0, skew_ms: 0, last_ts: 0, offline: Vec::new() };
 
     println!(
@@ -307,6 +315,7 @@ async fn main() {
             let i = next_dev;
             next_dev = (next_dev + 1) % args.devices;
             let (evs, is_fall) = make_events(&mut devices[i], now_ms);
+            truth.record(&evs, i.is_multiple_of(HEALTH_SAMPLE));
             counters.generated.fetch_add(evs.len() as u64, Relaxed);
             if phase == "burst" {
                 counters.generated_burst.fetch_add(evs.len() as u64, Relaxed);
@@ -327,6 +336,7 @@ async fn main() {
         }
         if args.new_device_at >= 0.0 && t >= args.new_device_at && fastrand::u8(0..100) == 0 {
             let (evs, is_fall) = make_events(&mut new_device, now_ms);
+            truth.record(&evs, true);
             counters.generated.fetch_add(evs.len() as u64, Relaxed);
             if is_fall {
                 counters.distinct_falls.fetch_add(1, Relaxed);
@@ -371,8 +381,20 @@ async fn main() {
         .and_then(|v| v["alarms"].as_array().map(|a| a.len() as u64))
         .unwrap_or(0);
     let new_dev = get_json(&client, &format!("{}/devices/{}/health", args.target, new_device.id)).await;
+    // Only meaningful if every generated event made it in.
+    let state_ok = if !args.verify {
+        None
+    } else if counters.failed.load(Relaxed) > 0 {
+        println!("  (state check skipped: some events failed)");
+        Some(false)
+    } else {
+        Some(truth.verify(&client, &args.target).await)
+    };
 
     report(&args, &counters, send_secs, falls, stored, &feed_seen, &latencies, &ack_lat, new_dev, new_device.seq > 0);
+    if state_ok == Some(false) {
+        std::process::exit(1);
+    }
 }
 
 async fn post_batch(
@@ -541,5 +563,151 @@ fn report(
     println!("  verdict                 {}", if ok { "✓ all events accepted, alarms == distinct falls, p95 < 1s" } else { "⚠ see numbers above" });
     if !ok {
         std::process::exit(1);
+    }
+}
+
+/// Health is checked on 1 device in this many (heartbeat seconds are kept
+/// per device; all of them would cost a few hundred MB at full scale).
+const HEALTH_SAMPLE: usize = 10;
+
+/// Every presence event per room, and heartbeat seconds for the sampled
+/// devices, as generated. The expected read model is recomputed from this
+/// with a plain sort-and-sweep, independent of the service's data structures.
+#[derive(Default)]
+struct GroundTruth {
+    /// room → [(ts_ms, device_id, seq, in_room)]
+    presence: HashMap<String, Vec<(i64, String, u64, bool)>>,
+    /// device → (heartbeat seconds, latest heartbeat ts_ms)
+    heartbeats: HashMap<String, (std::collections::HashSet<i64>, i64)>,
+}
+
+impl GroundTruth {
+    fn record(&mut self, evs: &[Value], sample_health: bool) {
+        for e in evs {
+            let ts = chrono::DateTime::parse_from_rfc3339(e["ts"].as_str().unwrap()).unwrap().timestamp_millis();
+            let dev = e["device_id"].as_str().unwrap();
+            match e["type"].as_str().unwrap() {
+                "presence" => self.presence.entry(e["room_id"].as_str().unwrap().to_owned()).or_default().push((
+                    ts,
+                    dev.to_owned(),
+                    e["seq"].as_u64().unwrap(),
+                    e["in_room"].as_bool().unwrap(),
+                )),
+                "heartbeat" if sample_health => {
+                    let (secs, last) = self.heartbeats.entry(dev.to_owned()).or_insert_with(|| (Default::default(), i64::MIN));
+                    secs.insert(ts.div_euclid(1000));
+                    *last = (*last).max(ts);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Spec semantics: the room's state at instant t is its latest presence
+    /// event (by `ts`, then device, then seq) at or before t; `occupied_pct`
+    /// is the occupied fraction of `(now - window, now]`; `in_room` is the
+    /// latest event overall.
+    fn expected_occupancy(events: &[(i64, String, u64, bool)], now: i64, window_ms: i64) -> f64 {
+        let start = now - window_ms;
+        let mut state = false;
+        let mut cursor = start;
+        let mut occupied = 0;
+        for (ts, _, _, v) in events {
+            if *ts <= start {
+                state = *v;
+                continue;
+            }
+            if *ts > now {
+                break;
+            }
+            if state {
+                occupied += ts - cursor;
+            }
+            (cursor, state) = (*ts, *v);
+        }
+        if state {
+            occupied += now - cursor;
+        }
+        occupied as f64 / window_ms as f64
+    }
+
+    /// Query every room (three windows) and every sampled device, and
+    /// compare. The server evaluates at its own `now`, somewhere in
+    /// `[t0, t1]` around the request; occupied time moves by at most 1 ms
+    /// per ms, so the allowed error is `(t1 - t0) / window`.
+    async fn verify(mut self, client: &reqwest::Client, target: &str) -> bool {
+        let now = || chrono::Utc::now().timestamp_millis();
+        let mut bad: Vec<String> = Vec::new();
+        let (mut windows_ok, mut windows, mut in_room_ok) = (0, 0, 0);
+        let rooms = self.presence.len();
+        for (room, evs) in self.presence.iter_mut() {
+            evs.sort();
+            for (w, window_ms) in [("1m", 60_000), ("5m", 300_000), ("1h", 3_600_000)] {
+                let t0 = now();
+                let got = get_json(client, &format!("{target}/rooms/{room}/occupancy?window={w}")).await;
+                let t1 = now();
+                windows += 1;
+                let Some(got) = got else {
+                    bad.push(format!("{room} {w}: no response"));
+                    continue;
+                };
+                let exp = Self::expected_occupancy(evs, t0, window_ms);
+                let pct = got["occupied_pct"].as_f64().unwrap_or(f64::NAN);
+                let tol = (t1 - t0 + 1) as f64 / window_ms as f64 + 1e-9;
+                if (pct - exp).abs() <= tol {
+                    windows_ok += 1;
+                } else {
+                    bad.push(format!("{room} {w}: occupied_pct {pct:.6}, expected {exp:.6} (±{tol:.6})"));
+                }
+                if w == "1h" {
+                    let exp_in = evs.last().is_some_and(|e| e.3);
+                    if got["in_room"].as_bool() == Some(exp_in) {
+                        in_room_ok += 1;
+                    } else {
+                        bad.push(format!("{room}: in_room {}, expected {exp_in}", got["in_room"]));
+                    }
+                }
+            }
+        }
+        let (mut health_ok, devices) = (0, self.heartbeats.len());
+        for (dev, (secs, last)) in &self.heartbeats {
+            let t0 = now();
+            let got = get_json(client, &format!("{target}/devices/{dev}/health")).await;
+            let t1 = now();
+            let Some(got) = got else {
+                bad.push(format!("{dev}: no response"));
+                continue;
+            };
+            // Distinct heartbeat seconds in (now_s - 300, now_s], for any
+            // now_s the server could have used.
+            let count = |now_s: i64| secs.iter().filter(|&&s| s > now_s - 300 && s <= now_s).count() as u64;
+            let candidates: Vec<u64> = (t0.div_euclid(1000)..=t1.div_euclid(1000)).map(count).collect();
+            let hb = got["heartbeats_5m"].as_u64();
+            let last_got = got["last_heartbeat_ts"]
+                .as_str()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.timestamp_millis());
+            if hb.is_some_and(|h| candidates.contains(&h)) && last_got == Some(*last) {
+                health_ok += 1;
+            } else {
+                bad.push(format!(
+                    "{dev}: heartbeats_5m {:?} / last {:?}, expected {candidates:?} / {}",
+                    hb,
+                    got["last_heartbeat_ts"].as_str(),
+                    iso(*last)
+                ));
+            }
+        }
+        println!("\n=== state vs ground truth ===");
+        println!("  occupancy windows       {windows_ok}/{windows} match (1m/5m/1h over {rooms} rooms)");
+        println!("  in_room                 {in_room_ok}/{rooms} match");
+        println!("  device health           {health_ok}/{devices} match (heartbeats_5m, last_heartbeat_ts; 1 device in {HEALTH_SAMPLE})");
+        for b in bad.iter().take(10) {
+            println!("    ✗ {b}");
+        }
+        if bad.len() > 10 {
+            println!("    … {} more", bad.len() - 10);
+        }
+        bad.is_empty()
     }
 }

@@ -1,8 +1,8 @@
 # Submission, Real-time Streaming Backend
 
-**Your name:**
-**Email:**
-**Link to your fork or solution:**
+**Your name:** Icham Lecorvaisier
+**Email:** icham.lecorvaisier@gmail.com
+**Link to your fork or solution:** https://github.com/ichoupinou/careers-challenge-streaming-backend
 
 ---
 
@@ -36,10 +36,10 @@ Details: [`service/README.md`](service/README.md).
 
 `make kill-test-full`, on an Apple M2 laptop (8 GB), with the load generator on the same machine:
 
-- **Sustained ingest rate:** 50.7k ev/s during both 30s bursts; 4.26M events, 0 rejected for overload (503), 0 lost. POST→202 latency p95 3.5 ms.
-- **Alarm feed latency p50 / p95:** 0.48 ms / 4.2 ms from POST to SSE receipt (p99 15 ms, n = 55,017).
-- **Behavior under hard kill + restart:** back in 0.30s (snapshot plus 45.6k WAL events in 220 ms). State is identical before and after. An independent SSE consumer saw all 55,017 alarms with no gaps and no duplicates.
-- **Aggregation correctness on replayed events:** 58k buffered events replayed, landing at the moment of the kill. Alarms == distinct falls on both feed and store. Device 5,001 is visible without a redeploy.
+- **Sustained ingest rate:** 50.7k ev/s during both 30s bursts; 4.26M events, 0 rejected for overload (503), 0 lost. POST→202 latency p95 9.6 ms.
+- **Alarm feed latency p50 / p95:** 0.53 ms / 11.6 ms from POST to SSE receipt (p99 21 ms, n = 55,371).
+- **Behavior under hard kill + restart:** back in 0.30s (snapshot plus 45k WAL events in 241 ms). An independent SSE consumer saw all 55,371 alarms with no gaps and no duplicates.
+- **Aggregation correctness on replayed events:** 62k buffered events replayed around the kill. Afterwards the recovered state was compared with a ground truth recomputed from every generated event: **7,503/7,503** occupancy windows (1m/5m/1h, all rooms), 2,501/2,501 `in_room`, 501/501 sampled device health. Alarms == distinct falls. Device 5,001 is visible without a redeploy.
 
 ## With another week
 

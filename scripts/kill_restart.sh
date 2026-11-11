@@ -10,7 +10,8 @@
 #   4. when the generator finishes, check:
 #        - alarms in /alarms == distinct falls in the generator's ground truth
 #          (with GEN=loadgen: its own verdict, which also retries every
-#          request the kill cut off, so nothing may be lost)
+#          request the kill cut off, so nothing may be lost, and compares
+#          the recovered occupancy and health with its ground truth)
 #        - the SSE consumer saw every alarm_id exactly once, across the restart
 #        - health/occupancy samples before and after the kill
 #
@@ -112,7 +113,7 @@ if [[ "$GEN" == loadgen ]]; then
   kill -TERM "$SSE"; wait "$SSE" || true; SSE=
   SSE_SUMMARY=$(cat "$WORK/sse.json")
   echo
-  sed -n '/=== loadgen report ===/,$p' "$WORK/gen.out"
+  sed -En '/^=== (state vs ground truth|loadgen report) ===/,$p' "$WORK/gen.out"
   echo "  SSE consumer (independent): $SSE_SUMMARY"
   PASS=1
   [[ "$GEN_RC" == 0 ]] || { echo "  ✗ loadgen verdict failed"; PASS=0; }
