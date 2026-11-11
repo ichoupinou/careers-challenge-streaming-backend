@@ -34,7 +34,8 @@ struct Args {
     /// Baseline events/s across all devices (default: 1 per device).
     rate: f64,
     burst_rate: f64,
-    burst_at: f64,
+    /// Burst start times, seconds (`--burst-at 15,90`).
+    burst_at: Vec<f64>,
     burst_secs: f64,
     offline_frac: f64,
     offline_at: f64,
@@ -55,7 +56,7 @@ impl Args {
             duration: 60.0,
             rate: -1.0,
             burst_rate: 0.0,
-            burst_at: 15.0,
+            burst_at: vec![15.0],
             burst_secs: 30.0,
             offline_frac: 0.0,
             offline_at: 10.0,
@@ -79,7 +80,9 @@ impl Args {
                 "--duration" => a.duration = num()?,
                 "--rate" => a.rate = num()?,
                 "--burst-rate" => a.burst_rate = num()?,
-                "--burst-at" => a.burst_at = num()?,
+                "--burst-at" => {
+                    a.burst_at = v.split(',').map(|x| x.trim().parse::<f64>().map_err(|e| format!("{k}: {e}"))).collect::<Result<_, _>>()?
+                }
                 "--burst-secs" => a.burst_secs = num()?,
                 "--offline-frac" => a.offline_frac = num()?,
                 "--offline-at" => a.offline_at = num()?,
@@ -97,8 +100,12 @@ impl Args {
         Ok(a)
     }
 
+    fn in_burst(&self, t: f64) -> bool {
+        self.burst_rate > 0.0 && self.burst_at.iter().any(|&b| t >= b && t < b + self.burst_secs)
+    }
+
     fn rate_at(&self, t: f64) -> f64 {
-        if self.burst_rate > 0.0 && t >= self.burst_at && t < self.burst_at + self.burst_secs {
+        if self.in_burst(t) {
             self.burst_rate
         } else {
             self.rate
@@ -106,16 +113,24 @@ impl Args {
     }
 
     fn phase(&self, t: f64) -> &'static str {
-        if self.burst_rate > 0.0 && t >= self.burst_at && t < self.burst_at + self.burst_secs {
+        if self.in_burst(t) {
             "burst"
         } else {
             "baseline"
         }
     }
+
+    /// Seconds of the run spent in a burst.
+    fn burst_total_secs(&self) -> f64 {
+        if self.burst_rate <= 0.0 {
+            return 0.0;
+        }
+        self.burst_at.iter().map(|&b| self.burst_secs.min((self.duration - b).max(0.0))).sum()
+    }
 }
 
 const HELP: &str = "loadgen [--target URL] [--devices N] [--duration S] [--rate EV/S]
-        [--burst-rate EV/S --burst-at S --burst-secs S]
+        [--burst-rate EV/S --burst-at S[,S...] --burst-secs S]
         [--offline-frac F --offline-at S --offline-secs S] [--skew S]
         [--batch N] [--concurrency N] [--new-device-at S (<0 off)]";
 
@@ -252,7 +267,7 @@ async fn main() {
         args.target,
         args.devices,
         args.rate,
-        if args.burst_rate > 0.0 { format!(", {:.0} ev/s burst at {}s for {}s", args.burst_rate, args.burst_at, args.burst_secs) } else { String::new() },
+        if args.burst_rate > 0.0 { format!(", {:.0} ev/s burst at {:?}s for {}s", args.burst_rate, args.burst_at, args.burst_secs) } else { String::new() },
         args.duration,
         args.batch,
         args.concurrency
@@ -481,7 +496,7 @@ fn report(
 ) {
     let mut lat = lat.lock().clone();
     let mut acks = acks.lock().clone();
-    let burst_secs = if args.burst_rate > 0.0 { args.burst_secs.min((args.duration - args.burst_at).max(0.0)) } else { 0.0 };
+    let burst_secs = args.burst_total_secs();
     let base_secs = (args.duration - burst_secs).max(1e-9);
     let replayed = c.replayed.load(Relaxed);
     let (generated, sent, failed) = (c.generated.load(Relaxed), c.sent_ok.load(Relaxed), c.failed.load(Relaxed));

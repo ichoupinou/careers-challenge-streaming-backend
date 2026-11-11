@@ -12,10 +12,19 @@ path = "src/lib.rs"
 name = "stream-service"
 path = "src/main.rs"
 
+# Load generator (`make load`): only built with `--features loadgen`, so the
+# service build doesn't pull in an HTTP client.
+[[bin]]
+name = "loadgen"
+path = "src/bin/loadgen.rs"
+required-features = ["loadgen"]
+
+[features]
+loadgen = ["dep:reqwest", "dep:fastrand"]
+
 [dependencies]
-# loadgen-only: HTTP client and RNG (unused by the service binary).
-reqwest = { version = "0.12", default-features = false, features = ["stream"] }
-fastrand = "2"
+reqwest = { version = "0.12", default-features = false, features = ["stream"], optional = true }
+fastrand = { version = "2", optional = true }
 axum = "0.8"
 parking_lot = "0.12"
 postcard = { version = "1", features = ["use-std"] }
