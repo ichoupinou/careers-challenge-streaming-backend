@@ -6,23 +6,34 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
-use stream_service::api::{router, AppState};
+use stream_service::api::router;
+use stream_service::app;
 use stream_service::clock::MockClock;
 use stream_service::config::Config;
 use tower::ServiceExt;
 
 const NOW: i64 = 1_779_562_429_123; // 2026-05-23T18:53:49.123Z
 
-fn app() -> axum::Router {
-    router(AppState::new(Config::default(), Arc::new(MockClock::new(NOW))))
+/// A running service on a temp data dir. Dropping it stops the pipeline.
+struct TestApp {
+    router: axum::Router,
+    _svc: app::Service,
+    _dir: tempfile::TempDir,
+}
+
+fn app() -> TestApp {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config { data_dir: dir.path().to_path_buf(), ..Config::default() };
+    let svc = app::start(config, Arc::new(MockClock::new(NOW))).unwrap();
+    TestApp { router: router(svc.app.clone()), _svc: svc, _dir: dir }
 }
 
 async fn call(req: Request<Body>) -> (StatusCode, Value) {
     call_on(&app(), req).await
 }
 
-async fn call_on(app: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
-    let resp = app.clone().oneshot(req).await.unwrap();
+async fn call_on(app: &TestApp, req: Request<Body>) -> (StatusCode, Value) {
+    let resp = app.router.clone().oneshot(req).await.unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
@@ -106,8 +117,8 @@ async fn read_endpoints_have_eval_shapes() {
 #[tokio::test]
 async fn readiness_gate() {
     assert_eq!(get("/healthz").await.0, StatusCode::OK);
-    // AppState starts not-ready until recovery completes.
-    assert_eq!(get("/readyz").await.0, StatusCode::SERVICE_UNAVAILABLE);
+    // `app::start` only returns once recovery is done.
+    assert_eq!(get("/readyz").await.0, StatusCode::OK);
 }
 
 fn post_req(body: Value) -> Request<Body> {
@@ -159,4 +170,33 @@ async fn ingest_then_read_back() {
     let (_, b) = call_on(&app, get_req("/rooms/room_000/occupancy?window=1m")).await;
     assert_eq!(b["in_room"], false);
     assert!((b["occupied_pct"].as_f64().unwrap() - 0.5).abs() < 1e-3, "{b}");
+}
+
+#[tokio::test]
+async fn state_survives_restart_via_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config { data_dir: dir.path().to_path_buf(), ..Config::default() };
+    let fall = json!({ "device_id": "dev_0007", "room_id": "room_003", "type": "fall_warn",
+                       "ts": "2026-05-23T18:53:40.000Z", "seq": 1, "confidence": 0.9 });
+    let start = || {
+        let svc = app::start(config.clone(), Arc::new(MockClock::new(NOW))).unwrap();
+        TestApp { router: router(svc.app.clone()), _svc: svc, _dir: tempfile::tempdir().unwrap() }
+    };
+    {
+        let a = start();
+        assert_eq!(call_on(&a, post_req(fall.clone())).await.0, StatusCode::ACCEPTED);
+        assert_eq!(call_on(&a, post_req(hb("2026-05-23T18:53:49.000Z"))).await.0, StatusCode::ACCEPTED);
+        // Dropped without a graceful shutdown: like a kill, the WAL alone must suffice.
+        std::mem::forget(a);
+    }
+    let b = start();
+    let (_, body) = call_on(&b, get_req("/alarms?since=0")).await;
+    assert_eq!(body["alarms"].as_array().unwrap().len(), 1, "{body}");
+    assert_eq!(body["alarms"][0]["alarm_id"], 1, "same id after replay");
+    // A jitter copy arriving after the restart is still deduplicated.
+    assert_eq!(call_on(&b, post_req(fall)).await.0, StatusCode::ACCEPTED);
+    let (_, body) = call_on(&b, get_req("/alarms?since=0")).await;
+    assert_eq!(body["alarms"].as_array().unwrap().len(), 1);
+    let (_, body) = call_on(&b, get_req("/devices/dev_0001/health")).await;
+    assert_eq!(body["last_heartbeat_ts"], "2026-05-23T18:53:49.000Z");
 }

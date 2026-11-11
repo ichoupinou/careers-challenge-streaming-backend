@@ -3,13 +3,14 @@
 PYTHON ?= python3
 SERVICE_URL ?= http://localhost:8080
 
-.PHONY: help run build test example smoke baseline burst offline adversarial
+.PHONY: help run build test clean-data example smoke baseline burst offline adversarial
 
 help:
 	@echo "Targets:"
 	@echo "  run            build (release) and run the Rust service on :8080"
 	@echo "  build          release build of the Rust service"
 	@echo "  test           cargo test for the Rust service"
+	@echo "  clean-data     delete ./data (WAL); do this between eval scenarios"
 	@echo "  example        run the example stub service on :8080"
 	@echo "  smoke          30s baseline run against \$$SERVICE_URL + scorecard"
 	@echo "  baseline       60s baseline"
@@ -31,6 +32,9 @@ build:
 
 test:
 	$(CARGO) test --manifest-path $(MANIFEST)
+
+clean-data:
+	rm -rf ./data
 
 example:
 	$(PYTHON) example_solution/service.py

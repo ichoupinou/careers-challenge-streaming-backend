@@ -1,8 +1,7 @@
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use stream_service::api;
+use stream_service::{api, app};
 use stream_service::clock::SystemClock;
 use stream_service::config::Config;
 use tracing_subscriber::EnvFilter;
@@ -13,9 +12,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing(config.log_json);
     tracing::info!(?config, "starting");
 
-    let state = api::AppState::new(config.clone(), Arc::new(SystemClock));
-    // TODO(milestone 4): recover snapshot + WAL before flipping ready.
-    state.ready.store(true, Ordering::Release);
+    let app::Service { app: state, pipeline } = app::start(config.clone(), Arc::new(SystemClock))?;
 
     let housekeeping = state.clone();
     tokio::spawn(async move {
@@ -32,6 +29,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, api::router(state))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    // Drain queued events into the WAL and fsync before exiting.
+    tokio::task::spawn_blocking(move || pipeline.shutdown()).await?;
     tracing::info!("stopped");
     Ok(())
 }

@@ -6,7 +6,10 @@
 //! `ts`, so late and out-of-order events need no special fix-up logic.
 
 pub mod api;
+pub mod app;
 pub mod clock;
 pub mod config;
 pub mod event;
+pub mod ingest;
 pub mod state;
+pub mod wal;

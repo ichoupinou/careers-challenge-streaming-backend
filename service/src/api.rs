@@ -1,16 +1,15 @@
 //! HTTP API. Response shapes follow `example_solution/service.py`, which is
 //! what the eval reads; extra fields are tolerated by the scorer.
 //!
-//! Milestone 2: accepted events are applied straight to in-memory `State`
-//! under a lock. Milestone 3 replaces that with the WAL writer and applier
-//! thread behind the same routes.
+//! Writes go through the ingest pipeline (`crate::ingest`). Reads take a
+//! short read lock on the materialized state.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -20,6 +19,7 @@ use serde_json::{json, Value};
 use crate::clock::{Clock, Millis};
 use crate::config::Config;
 use crate::event::{self, Event, Reject};
+use crate::ingest::{Ingest, IngestError};
 use crate::state::alarms::Alarm;
 use crate::state::State as Materialized;
 use parking_lot::RwLock;
@@ -32,22 +32,15 @@ pub struct AppState {
     pub clock: Arc<dyn Clock>,
     /// False until recovery has finished.
     pub ready: AtomicBool,
-    pub state: RwLock<Materialized>,
+    /// Written only by the applier thread.
+    pub state: Arc<RwLock<Materialized>>,
+    pub ingest: Ingest,
 }
 
 impl AppState {
-    pub fn new(config: Config, clock: Arc<dyn Clock>) -> Arc<Self> {
-        let state = RwLock::new(Materialized::new(config.dedup_window_ms));
-        Arc::new(Self { config, clock, ready: AtomicBool::new(false), state })
-    }
-
-    /// Apply accepted events. TODO(milestone 3): go through the WAL instead.
-    fn ingest(&self, events: &[Event], recv_ms: Millis) {
-        let mut st = self.state.write();
-        for ev in events {
-            let offset = st.last_offset + 1;
-            st.apply(ev, offset, recv_ms);
-        }
+    /// Submit validated events and map pipeline failures to HTTP errors.
+    async fn submit(&self, events: Vec<Event>, recv_ms: Millis) -> Result<(), ApiError> {
+        self.ingest.submit(events, recv_ms).await.map_err(ApiError::from)
     }
 
     /// Periodic housekeeping: drop history no read can need any more.
@@ -95,9 +88,28 @@ impl From<Reject> for ApiError {
     }
 }
 
+impl From<IngestError> for ApiError {
+    fn from(e: IngestError) -> Self {
+        let (status, code) = match e {
+            IngestError::Overloaded => (StatusCode::SERVICE_UNAVAILABLE, "overloaded"),
+            IngestError::ShuttingDown => (StatusCode::SERVICE_UNAVAILABLE, "shutting_down"),
+            IngestError::Wal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "wal_error"),
+        };
+        if e == IngestError::Overloaded {
+            tracing::warn!("shed request: ingest queue full");
+        }
+        Self { status, code, detail: e.to_string() }
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.code, "detail": self.detail }))).into_response()
+        let body = Json(json!({ "error": self.code, "detail": self.detail }));
+        if self.status == StatusCode::SERVICE_UNAVAILABLE {
+            // Ask well-behaved clients to back off and retry.
+            return (self.status, [(header::RETRY_AFTER, "1")], body).into_response();
+        }
+        (self.status, body).into_response()
     }
 }
 
@@ -106,7 +118,10 @@ impl IntoResponse for ApiError {
 /// `POST /events`: a single event object, or a JSON array of events.
 ///
 /// Single event: 202 if accepted, 400 if malformed, 422 if `ts` is outside
-/// the acceptance window. Batch: 202 with per-index rejections.
+/// the acceptance window. Batch: 202 with per-index rejections. 202 means
+/// written to the WAL and applied. 503 + `Retry-After` means the queue
+/// stayed full for `ENQUEUE_TIMEOUT_MS` and nothing from the request was
+/// accepted.
 async fn post_events(State(st): State<Arc<AppState>>, body: Bytes) -> ApiResult {
     let parsed: Value = serde_json::from_slice(&body)
         .map_err(|e| ApiError::bad_request("malformed", format!("invalid JSON: {e}")))?;
@@ -125,12 +140,13 @@ async fn post_events(State(st): State<Arc<AppState>>, body: Bytes) -> ApiResult 
                     }
                 }
             }
-            st.ingest(&accepted, now);
-            Ok((StatusCode::ACCEPTED, Json(json!({ "accepted": accepted.len(), "rejected": rejected }))).into_response())
+            let n = accepted.len();
+            st.submit(accepted, now).await?;
+            Ok((StatusCode::ACCEPTED, Json(json!({ "accepted": n, "rejected": rejected }))).into_response())
         }
         single => {
             let ev = event::validate(&single, now).inspect_err(|r| tracing::debug!(reason = r.code(), "rejected event: {r}"))?;
-            st.ingest(std::slice::from_ref(&ev), now);
+            st.submit(vec![ev], now).await?;
             Ok((StatusCode::ACCEPTED, Json(json!({ "accepted": 1, "rejected": [] }))).into_response())
         }
     }
