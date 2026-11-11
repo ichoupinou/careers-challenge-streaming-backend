@@ -17,6 +17,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TODO(milestone 4): recover snapshot + WAL before flipping ready.
     state.ready.store(true, Ordering::Release);
 
+    let housekeeping = state.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            housekeeping.prune();
+        }
+    });
+
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "listening");

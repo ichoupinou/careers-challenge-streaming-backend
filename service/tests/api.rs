@@ -18,7 +18,11 @@ fn app() -> axum::Router {
 }
 
 async fn call(req: Request<Body>) -> (StatusCode, Value) {
-    let resp = app().oneshot(req).await.unwrap();
+    call_on(&app(), req).await
+}
+
+async fn call_on(app: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
+    let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
@@ -104,4 +108,55 @@ async fn readiness_gate() {
     assert_eq!(get("/healthz").await.0, StatusCode::OK);
     // AppState starts not-ready until recovery completes.
     assert_eq!(get("/readyz").await.0, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+fn post_req(body: Value) -> Request<Body> {
+    Request::post("/events")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+fn get_req(uri: &str) -> Request<Body> {
+    Request::get(uri).body(Body::empty()).unwrap()
+}
+
+#[tokio::test]
+async fn ingest_then_read_back() {
+    let app = app();
+    let ev = |ty: &str, ts: &str, seq: u64, extra: Value| {
+        let mut e = json!({ "device_id": "dev_0000", "room_id": "room_000", "type": ty, "ts": ts, "seq": seq });
+        e.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        e
+    };
+    // A fall sent three times (sensor jitter), a heartbeat, and presence
+    // arriving out of order.
+    let fall = ev("fall_warn", "2026-05-23T18:53:40.000Z", 1, json!({ "confidence": 0.92 }));
+    for _ in 0..3 {
+        assert_eq!(call_on(&app, post_req(fall.clone())).await.0, StatusCode::ACCEPTED);
+    }
+    let batch = json!([
+        ev("heartbeat", "2026-05-23T18:53:49.000Z", 5, json!({})),
+        ev("presence", "2026-05-23T18:53:19.123Z", 4, json!({ "in_room": false })),
+        ev("presence", "2026-05-23T18:52:49.123Z", 3, json!({ "in_room": true })),
+    ]);
+    assert_eq!(call_on(&app, post_req(batch)).await.1["accepted"], 3);
+
+    let (_, b) = call_on(&app, get_req("/alarms?since=0")).await;
+    let alarms = b["alarms"].as_array().unwrap();
+    assert_eq!(alarms.len(), 1, "jitter copies deduplicated: {b}");
+    assert_eq!(alarms[0]["ts"], "2026-05-23T18:53:40.000Z");
+    assert_eq!(alarms[0]["room_id"], "room_000");
+    assert_eq!(b["next_cursor"], 1);
+    let (_, b) = call_on(&app, get_req("/alarms?since=1")).await;
+    assert!(b["alarms"].as_array().unwrap().is_empty());
+
+    let (_, b) = call_on(&app, get_req("/devices/dev_0000/health")).await;
+    assert_eq!(b["last_heartbeat_ts"], "2026-05-23T18:53:49.000Z");
+    assert!((b["availability_5m"].as_f64().unwrap() - 1.0 / 300.0).abs() < 1e-9);
+
+    // Occupied from -60s to -30s of the last minute; latest presence is false.
+    let (_, b) = call_on(&app, get_req("/rooms/room_000/occupancy?window=1m")).await;
+    assert_eq!(b["in_room"], false);
+    assert!((b["occupied_pct"].as_f64().unwrap() - 0.5).abs() < 1e-3, "{b}");
 }

@@ -1,9 +1,9 @@
 //! HTTP API. Response shapes follow `example_solution/service.py`, which is
 //! what the eval reads; extra fields are tolerated by the scorer.
 //!
-//! Milestone 1: ingest validates but does not yet persist, and read
-//! endpoints return empty aggregates. State, WAL and feed come in later
-//! milestones behind the same routes.
+//! Milestone 2: accepted events are applied straight to in-memory `State`
+//! under a lock. Milestone 3 replaces that with the WAL writer and applier
+//! thread behind the same routes.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -19,7 +19,10 @@ use serde_json::{json, Value};
 
 use crate::clock::{Clock, Millis};
 use crate::config::Config;
-use crate::event::{self, Reject};
+use crate::event::{self, Event, Reject};
+use crate::state::alarms::Alarm;
+use crate::state::State as Materialized;
+use parking_lot::RwLock;
 
 /// Longest occupancy window we retain history for.
 pub const MAX_WINDOW_SECS: u32 = 3600;
@@ -29,11 +32,29 @@ pub struct AppState {
     pub clock: Arc<dyn Clock>,
     /// False until recovery has finished.
     pub ready: AtomicBool,
+    pub state: RwLock<Materialized>,
 }
 
 impl AppState {
     pub fn new(config: Config, clock: Arc<dyn Clock>) -> Arc<Self> {
-        Arc::new(Self { config, clock, ready: AtomicBool::new(false) })
+        let state = RwLock::new(Materialized::new(config.dedup_window_ms));
+        Arc::new(Self { config, clock, ready: AtomicBool::new(false), state })
+    }
+
+    /// Apply accepted events. TODO(milestone 3): go through the WAL instead.
+    fn ingest(&self, events: &[Event], recv_ms: Millis) {
+        let mut st = self.state.write();
+        for ev in events {
+            let offset = st.last_offset + 1;
+            st.apply(ev, offset, recv_ms);
+        }
+    }
+
+    /// Periodic housekeeping: drop history no read can need any more.
+    pub fn prune(&self) {
+        let now = self.clock.now_ms();
+        let retention = self.config.alarm_retention.as_millis() as Millis;
+        self.state.write().prune(now, retention);
     }
 }
 
@@ -104,12 +125,12 @@ async fn post_events(State(st): State<Arc<AppState>>, body: Bytes) -> ApiResult 
                     }
                 }
             }
-            // TODO(milestone 3): hand `accepted` to the WAL writer and wait for the ack.
+            st.ingest(&accepted, now);
             Ok((StatusCode::ACCEPTED, Json(json!({ "accepted": accepted.len(), "rejected": rejected }))).into_response())
         }
         single => {
-            let _ev = event::validate(&single, now).inspect_err(|r| tracing::debug!(reason = r.code(), "rejected event: {r}"))?;
-            // TODO(milestone 3): hand `_ev` to the WAL writer and wait for the ack.
+            let ev = event::validate(&single, now).inspect_err(|r| tracing::debug!(reason = r.code(), "rejected event: {r}"))?;
+            st.ingest(std::slice::from_ref(&ev), now);
             Ok((StatusCode::ACCEPTED, Json(json!({ "accepted": 1, "rejected": [] }))).into_response())
         }
     }
@@ -117,12 +138,18 @@ async fn post_events(State(st): State<Arc<AppState>>, body: Bytes) -> ApiResult 
 
 // ----------------------------------------------------------------- reads
 
-async fn device_health(Path(device_id): Path<String>) -> Json<Value> {
+async fn device_health(State(st): State<Arc<AppState>>, Path(device_id): Path<String>) -> Json<Value> {
     // Unknown devices are not an error: a new device needs no registration.
+    let h = st.state.read().device_health(&device_id, st.clock.now_ms());
     Json(json!({
         "device_id": device_id,
-        "last_heartbeat_ts": Value::Null,
-        "availability_5m": 0.0,
+        "last_heartbeat_ts": h.last_heartbeat_ms.map(event::format_ts),
+        "availability_5m": h.availability_5m,
+        "heartbeats_5m": h.heartbeats_5m,
+        "room_id": h.room_id,
+        "motion": h.motion,
+        "sleep_state": h.sleep_state,
+        "rssi": h.rssi,
     }))
 }
 
@@ -131,12 +158,17 @@ struct OccupancyQuery {
     window: Option<String>,
 }
 
-async fn room_occupancy(Path(room_id): Path<String>, Query(q): Query<OccupancyQuery>) -> ApiResult {
+async fn room_occupancy(
+    State(st): State<Arc<AppState>>,
+    Path(room_id): Path<String>,
+    Query(q): Query<OccupancyQuery>,
+) -> ApiResult {
     let window_seconds = parse_window(q.window.as_deref().unwrap_or("5m"))?;
+    let o = st.state.read().room_occupancy(&room_id, st.clock.now_ms(), window_seconds as Millis * 1000);
     Ok(Json(json!({
         "room_id": room_id,
-        "in_room": false,
-        "occupied_pct": 0.0,
+        "in_room": o.in_room,
+        "occupied_pct": o.occupied_pct,
         "window_seconds": window_seconds,
     }))
     .into_response())
@@ -184,15 +216,40 @@ pub fn parse_since(raw: Option<&str>) -> Result<Since, ApiError> {
 #[derive(Deserialize)]
 struct AlarmsQuery {
     since: Option<String>,
+    /// Page size. Unbounded by default: the eval reads `since=0` in one go.
+    limit: Option<usize>,
 }
 
-async fn alarms(Query(q): Query<AlarmsQuery>) -> ApiResult {
+/// `GET /alarms?since=<alarm_id|RFC 3339 ts>&limit=<n>`, in emission order.
+/// `next_cursor` is the last returned `alarm_id` (pass it back as `since`).
+async fn alarms(State(st): State<Arc<AppState>>, Query(q): Query<AlarmsQuery>) -> ApiResult {
     let since = parse_since(q.since.as_deref())?;
-    let next_cursor = match since {
-        Since::Cursor(c) => c,
-        Since::Ts(_) => 0,
+    let limit = q.limit.unwrap_or(usize::MAX);
+    let state = st.state.read();
+    let store = state.alarms();
+    let items: Vec<Value> = match since {
+        Since::Cursor(c) => store.after(c, limit).map(alarm_json).collect(),
+        Since::Ts(t) => store.since_ts(t, limit).map(alarm_json).collect(),
     };
-    Ok(Json(json!({ "alarms": [], "next_cursor": next_cursor })).into_response())
+    let next_cursor = items
+        .last()
+        .and_then(|a| a["alarm_id"].as_u64())
+        .unwrap_or(match since {
+            Since::Cursor(c) => c,
+            Since::Ts(_) => store.last_id(),
+        });
+    Ok(Json(json!({ "alarms": items, "next_cursor": next_cursor })).into_response())
+}
+
+pub fn alarm_json(a: &Alarm) -> Value {
+    json!({
+        "alarm_id": a.alarm_id,
+        "event_id": a.event_id,
+        "device_id": a.device_id,
+        "room_id": a.room_id,
+        "ts": event::format_ts(a.ts_ms),
+        "confidence": a.confidence,
+    })
 }
 
 async fn readyz(State(st): State<Arc<AppState>>) -> StatusCode {
