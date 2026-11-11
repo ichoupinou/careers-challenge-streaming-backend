@@ -13,6 +13,9 @@ name = "stream-service"
 path = "src/main.rs"
 
 [dependencies]
+# loadgen-only: HTTP client and RNG (unused by the service binary).
+reqwest = { version = "0.12", default-features = false, features = ["stream"] }
+fastrand = "2"
 axum = "0.8"
 parking_lot = "0.12"
 postcard = { version = "1", features = ["use-std"] }

@@ -3,7 +3,7 @@
 PYTHON ?= python3
 SERVICE_URL ?= http://localhost:8080
 
-.PHONY: help run build test clean-data example smoke baseline burst offline adversarial
+.PHONY: help run build test clean-data load kill-test example smoke baseline burst offline adversarial
 
 help:
 	@echo "Targets:"
@@ -11,6 +11,8 @@ help:
 	@echo "  build          release build of the Rust service"
 	@echo "  test           cargo test for the Rust service"
 	@echo "  clean-data     delete ./data (WAL); do this between eval scenarios"
+	@echo "  load           Rust load generator vs \$$SERVICE_URL: 5k devices, 50k ev/s burst, offline replay"
+	@echo "  kill-test      generator + kill -9 at 180s + restart; checks alarms and SSE gaps"
 	@echo "  example        run the example stub service on :8080"
 	@echo "  smoke          30s baseline run against \$$SERVICE_URL + scorecard"
 	@echo "  baseline       60s baseline"
@@ -35,6 +37,16 @@ test:
 
 clean-data:
 	rm -rf ./data
+
+LOAD_DEVICES ?= 5000
+LOAD_ARGS ?= --devices $(LOAD_DEVICES) --duration 90 --burst-rate 50000 --burst-at 15 --burst-secs 30 \
+	--offline-frac 0.2 --offline-at 50 --offline-secs 25 --skew 30
+
+load:
+	$(CARGO) run --release --quiet --manifest-path $(MANIFEST) --bin loadgen -- --target $(SERVICE_URL) $(LOAD_ARGS)
+
+kill-test:
+	scripts/kill_restart.sh
 
 example:
 	$(PYTHON) example_solution/service.py
