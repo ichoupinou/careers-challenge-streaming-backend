@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -23,6 +23,7 @@ use crate::clock::{Clock, Millis};
 use crate::config::Config;
 use crate::event::{self, Event, Reject};
 use crate::ingest::{Ingest, IngestError};
+use crate::metrics::{Gauges, Metrics, SubscriberGuard};
 use crate::state::alarms::Alarm;
 use crate::state::State as Materialized;
 use futures_util::{Stream, StreamExt};
@@ -44,12 +45,27 @@ pub struct AppState {
     pub alarm_rx: watch::Receiver<u64>,
     /// Set on shutdown so open SSE streams end and graceful shutdown completes.
     pub closing: watch::Sender<bool>,
+    pub metrics: Arc<Metrics>,
 }
 
 impl AppState {
     /// Submit validated events and map pipeline failures to HTTP errors.
-    async fn submit(&self, events: Vec<Event>, recv_ms: Millis) -> Result<(), ApiError> {
-        self.ingest.submit(events, recv_ms).await.map_err(ApiError::from)
+    async fn submit(&self, events: Vec<Event>, recv_ms: Millis, recv_at: Instant) -> Result<(), ApiError> {
+        self.ingest.submit(events, recv_ms, recv_at).await.map_err(ApiError::from)
+    }
+
+    /// Current values of the gauges owned by other components.
+    pub fn gauges(&self) -> Gauges {
+        let (fall_lane_depth, bulk_lane_depth) = self.ingest.lane_depths();
+        let st = self.state.read();
+        Gauges {
+            fall_lane_depth,
+            bulk_lane_depth,
+            last_offset: st.last_offset,
+            devices: st.device_count(),
+            rooms: st.room_count(),
+            alarms_retained: st.alarms().len(),
+        }
     }
 
     /// Close live feeds (call when the server starts shutting down).
@@ -72,6 +88,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/rooms/{room_id}/occupancy", get(room_occupancy))
         .route("/alarms", get(alarms))
         .route("/alarms/stream", get(alarm_stream))
+        .route("/metrics", get(metrics))
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(readyz))
         .with_state(state)
@@ -134,12 +151,16 @@ impl IntoResponse for ApiError {
 ///
 /// Single event: 202 if accepted, 400 if malformed, 422 if `ts` is outside
 /// the acceptance window. Batch: 202 with per-index rejections. 202 means
-/// written to the WAL and applied. 503 + `Retry-After` means the queue
-/// stayed full for `ENQUEUE_TIMEOUT_MS` and nothing from the request was
-/// accepted.
+/// written to the WAL and applied. 503 + `Retry-After` means a queue
+/// stayed full for `ENQUEUE_TIMEOUT_MS`. Part of a mixed batch may already
+/// have been accepted, and retrying is safe because applying an event twice
+/// is a no-op.
 async fn post_events(State(st): State<Arc<AppState>>, body: Bytes) -> ApiResult {
-    let parsed: Value = serde_json::from_slice(&body)
-        .map_err(|e| ApiError::bad_request("malformed", format!("invalid JSON: {e}")))?;
+    let recv_at = Instant::now();
+    let parsed: Value = serde_json::from_slice(&body).map_err(|e| {
+        st.metrics.rejected("invalid_json");
+        ApiError::bad_request("malformed", format!("invalid JSON: {e}"))
+    })?;
     let now = st.clock.now_ms();
 
     match parsed {
@@ -150,18 +171,22 @@ async fn post_events(State(st): State<Arc<AppState>>, body: Bytes) -> ApiResult 
                 match event::validate(item, now) {
                     Ok(ev) => accepted.push(ev),
                     Err(r) => {
+                        st.metrics.rejected(r.code());
                         tracing::debug!(index, reason = r.code(), "rejected event: {r}");
                         rejected.push(json!({ "index": index, "reason": r.code(), "detail": r.to_string() }));
                     }
                 }
             }
             let n = accepted.len();
-            st.submit(accepted, now).await?;
+            st.submit(accepted, now, recv_at).await?;
             Ok((StatusCode::ACCEPTED, Json(json!({ "accepted": n, "rejected": rejected }))).into_response())
         }
         single => {
-            let ev = event::validate(&single, now).inspect_err(|r| tracing::debug!(reason = r.code(), "rejected event: {r}"))?;
-            st.submit(vec![ev], now).await?;
+            let ev = event::validate(&single, now).inspect_err(|r| {
+                st.metrics.rejected(r.code());
+                tracing::debug!(reason = r.code(), "rejected event: {r}");
+            })?;
+            st.submit(vec![ev], now, recv_at).await?;
             Ok((StatusCode::ACCEPTED, Json(json!({ "accepted": 1, "rejected": [] }))).into_response())
         }
     }
@@ -313,6 +338,7 @@ struct StreamQuery {
 }
 
 struct StreamState {
+    _subscriber: SubscriberGuard,
     app: Arc<AppState>,
     cursor: u64,
     room: Option<String>,
@@ -341,6 +367,7 @@ async fn alarm_stream(
         None => q.since.unwrap_or(0),
     };
     let s = StreamState {
+        _subscriber: SubscriberGuard::new(st.metrics.clone()),
         cursor,
         room: q.room_id,
         alarms: st.alarm_rx.clone(),
@@ -381,6 +408,12 @@ pub fn alarm_json(a: &Alarm) -> Value {
         "ts": event::format_ts(a.ts_ms),
         "confidence": a.confidence,
     })
+}
+
+/// `GET /metrics`: Prometheus text format.
+async fn metrics(State(st): State<Arc<AppState>>) -> Response {
+    let body = st.metrics.render(&st.gauges());
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
 
 async fn readyz(State(st): State<Arc<AppState>>) -> StatusCode {

@@ -15,7 +15,7 @@
 //! `enqueue_timeout`, the request fails with an explicit `Overloaded`
 //! (HTTP 503), never a silent drop.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -26,6 +26,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::clock::Millis;
 use crate::config::{Config, FsyncPolicy};
 use crate::event::Event;
+use crate::metrics::Metrics;
 use crate::state::{Applied, State};
 use crate::wal::{Wal, WalRecord};
 
@@ -50,19 +51,9 @@ type Ack = oneshot::Sender<Result<(), IngestError>>;
 struct Submission {
     events: Vec<Event>,
     recv_ms: Millis,
+    /// When the request arrived, for latency metrics.
+    recv_at: Instant,
     ack: Ack,
-}
-
-#[derive(Debug, Default)]
-pub struct IngestStats {
-    pub accepted_events: AtomicU64,
-    pub shed_requests: AtomicU64,
-    pub batches: AtomicU64,
-    pub fsyncs: AtomicU64,
-    pub alarms: AtomicU64,
-    /// Sum and count of recv→applied latency for new alarms, in µs.
-    pub alarm_latency_us_sum: AtomicU64,
-    pub alarm_latency_us_max: AtomicU64,
 }
 
 /// Cloneable handle used by HTTP handlers.
@@ -71,14 +62,19 @@ pub struct Ingest {
     fall_tx: mpsc::Sender<Submission>,
     bulk_tx: mpsc::Sender<Submission>,
     enqueue_timeout: Duration,
-    pub stats: Arc<IngestStats>,
+    pub metrics: Arc<Metrics>,
 }
 
 impl Ingest {
     /// Enqueue validated events and wait until they're durable and applied.
     /// Falls go through the priority lane; a mixed batch is split and the
     /// call returns once both halves are done.
-    pub async fn submit(&self, events: Vec<Event>, recv_ms: Millis) -> Result<(), IngestError> {
+    ///
+    /// On `Overloaded`, part of a mixed batch may already be queued.
+    /// Retrying the whole request is safe: applying an event twice changes
+    /// nothing (heartbeat seconds are a set, presence is keyed by
+    /// `(ts, device, seq)`, falls are deduplicated).
+    pub async fn submit(&self, events: Vec<Event>, recv_ms: Millis, recv_at: Instant) -> Result<(), IngestError> {
         if events.is_empty() {
             return Ok(());
         }
@@ -90,10 +86,11 @@ impl Ingest {
                 continue;
             }
             let (ack, done) = oneshot::channel();
-            match lane.send_timeout(Submission { events, recv_ms, ack }, self.enqueue_timeout).await {
+            match lane.send_timeout(Submission { events, recv_ms, recv_at, ack }, self.enqueue_timeout).await {
                 Ok(()) => acks.push(done),
                 Err(mpsc::error::SendTimeoutError::Timeout(_)) => {
-                    self.stats.shed_requests.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.requests_shed.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.events_shed.fetch_add(n, Ordering::Relaxed);
                     return Err(IngestError::Overloaded);
                 }
                 Err(mpsc::error::SendTimeoutError::Closed(_)) => return Err(IngestError::ShuttingDown),
@@ -102,7 +99,7 @@ impl Ingest {
         for done in acks {
             done.await.map_err(|_| IngestError::ShuttingDown)??;
         }
-        self.stats.accepted_events.fetch_add(n, Ordering::Relaxed);
+        self.metrics.ingest_ack.observe(recv_at.elapsed());
         Ok(())
     }
 
@@ -120,10 +117,10 @@ pub struct Lanes {
 }
 
 /// Create the handle and the lanes. Nothing is processed until `start`.
-pub fn lanes(config: &Config) -> (Ingest, Lanes) {
+pub fn lanes(config: &Config, metrics: Arc<Metrics>) -> (Ingest, Lanes) {
     let (fall_tx, fall_rx) = mpsc::channel(config.fall_lane_capacity.max(1));
     let (bulk_tx, bulk_rx) = mpsc::channel(config.bulk_lane_capacity.max(1));
-    let ingest = Ingest { fall_tx, bulk_tx, enqueue_timeout: config.enqueue_timeout, stats: Arc::default() };
+    let ingest = Ingest { fall_tx, bulk_tx, enqueue_timeout: config.enqueue_timeout, metrics };
     (ingest, Lanes { fall_rx, bulk_rx })
 }
 
@@ -158,6 +155,8 @@ impl Drop for Pipeline {
 
 struct Batch {
     records: Vec<WalRecord>,
+    /// Arrival time of each record's request (parallel to `records`).
+    recv_at: Vec<Instant>,
     acks: Vec<Ack>,
 }
 
@@ -167,7 +166,7 @@ pub fn start(
     lanes: Lanes,
     wal: Wal,
     state: Arc<RwLock<State>>,
-    stats: Arc<IngestStats>,
+    metrics: Arc<Metrics>,
     alarm_tx: watch::Sender<u64>,
     config: &Config,
 ) -> Pipeline {
@@ -175,18 +174,18 @@ pub fn start(
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let fsync = (config.fsync, config.fsync_interval);
-    let writer_stats = stats.clone();
+    let writer_metrics = metrics.clone();
     let writer = std::thread::Builder::new()
         .name("wal-writer".into())
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().expect("writer runtime");
-            rt.block_on(writer_loop(lanes, wal, apply_tx, shutdown_rx, fsync, writer_stats));
+            rt.block_on(writer_loop(lanes, wal, apply_tx, shutdown_rx, fsync, writer_metrics));
         })
         .expect("spawn wal-writer");
 
     let applier = std::thread::Builder::new()
         .name("applier".into())
-        .spawn(move || applier_loop(apply_rx, state, stats, alarm_tx))
+        .spawn(move || applier_loop(apply_rx, state, metrics, alarm_tx))
         .expect("spawn applier");
 
     Pipeline { shutdown: Some(shutdown_tx), writer: Some(writer), applier: Some(applier) }
@@ -198,7 +197,7 @@ async fn writer_loop(
     apply_tx: std::sync::mpsc::SyncSender<Batch>,
     mut shutdown: oneshot::Receiver<()>,
     (policy, interval): (FsyncPolicy, Duration),
-    stats: Arc<IngestStats>,
+    stats: Arc<Metrics>,
 ) {
     let mut dirty = false;
     let mut last_sync = Instant::now();
@@ -267,25 +266,29 @@ fn write_batch(
     wal: &mut Wal,
     subs: Vec<Submission>,
     apply_tx: &std::sync::mpsc::SyncSender<Batch>,
-    stats: &IngestStats,
+    stats: &Metrics,
     sync_before_ack: bool,
 ) -> bool {
     let mut acks = Vec::with_capacity(subs.len());
     let mut events = Vec::new();
+    let mut recv_at = Vec::new();
     for s in subs {
+        recv_at.extend(std::iter::repeat_n(s.recv_at, s.events.len()));
         events.extend(s.events.into_iter().map(|e| (e, s.recv_ms)));
         acks.push(s.ack);
     }
     match wal.append(events) {
         Ok(records) => {
-            stats.batches.fetch_add(1, Ordering::Relaxed);
+            stats.wal_batches.fetch_add(1, Ordering::Relaxed);
+            stats.wal_bytes.fetch_add(wal.last_append_bytes(), Ordering::Relaxed);
             if sync_before_ack {
                 sync(wal, stats);
             }
-            apply_tx.send(Batch { records, acks }).is_ok()
+            apply_tx.send(Batch { records, recv_at, acks }).is_ok()
         }
         Err(e) => {
             // Fail loudly: callers get a 500 and nothing is acknowledged.
+            stats.wal_errors.fetch_add(1, Ordering::Relaxed);
             tracing::error!(error = %e, "WAL append failed; refusing writes");
             for ack in acks {
                 let _ = ack.send(Err(IngestError::Wal(e.to_string())));
@@ -295,37 +298,44 @@ fn write_batch(
     }
 }
 
-fn sync(wal: &mut Wal, stats: &IngestStats) {
+fn sync(wal: &mut Wal, stats: &Metrics) {
+    let t = Instant::now();
     match wal.sync() {
         Ok(()) => {
-            stats.fsyncs.fetch_add(1, Ordering::Relaxed);
+            stats.wal_fsyncs.fetch_add(1, Ordering::Relaxed);
+            stats.wal_fsync.observe(t.elapsed());
         }
-        Err(e) => tracing::error!(error = %e, "WAL fsync failed"),
+        Err(e) => {
+            stats.wal_errors.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(error = %e, "WAL fsync failed");
+        }
     }
 }
 
-fn applier_loop(rx: std::sync::mpsc::Receiver<Batch>, state: Arc<RwLock<State>>, stats: Arc<IngestStats>, alarm_tx: watch::Sender<u64>) {
+fn applier_loop(rx: std::sync::mpsc::Receiver<Batch>, state: Arc<RwLock<State>>, metrics: Arc<Metrics>, alarm_tx: watch::Sender<u64>) {
     while let Ok(batch) = rx.recv() {
         let mut alarms = Vec::new();
         {
             let mut st = state.write();
-            for rec in &batch.records {
-                if let Applied::Alarm(a) = st.apply(&rec.event, rec.offset, rec.recv_ms) {
-                    alarms.push(a);
+            for (rec, recv_at) in batch.records.iter().zip(&batch.recv_at) {
+                metrics.accepted(&rec.event.kind);
+                match st.apply(&rec.event, rec.offset, rec.recv_ms) {
+                    Applied::Alarm(a) => alarms.push((a, *recv_at)),
+                    Applied::DuplicateFall { .. } => {
+                        metrics.falls_deduped.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Applied::Plain => {}
                 }
             }
         }
-        let now = chrono::Utc::now().timestamp_millis();
-        for a in &alarms {
-            let us = ((now - a.recv_ms).max(0) as u64) * 1000;
-            stats.alarms.fetch_add(1, Ordering::Relaxed);
-            stats.alarm_latency_us_sum.fetch_add(us, Ordering::Relaxed);
-            stats.alarm_latency_us_max.fetch_max(us, Ordering::Relaxed);
-            tracing::debug!(alarm_id = a.alarm_id, room = %a.room_id, device = %a.device_id, "alarm");
-        }
         // Wake feed subscribers; they read the new alarms from the store.
-        if let Some(last) = alarms.last() {
+        if let Some((last, _)) = alarms.last() {
             alarm_tx.send_replace(last.alarm_id);
+        }
+        for (a, recv_at) in &alarms {
+            metrics.alarms.fetch_add(1, Ordering::Relaxed);
+            metrics.alarm_emit.observe(recv_at.elapsed());
+            tracing::debug!(alarm_id = a.alarm_id, room = %a.room_id, device = %a.device_id, "alarm");
         }
         for ack in batch.acks {
             let _ = ack.send(Ok(()));
@@ -337,6 +347,7 @@ fn applier_loop(rx: std::sync::mpsc::Receiver<Batch>, state: Arc<RwLock<State>>,
 mod tests {
     use super::*;
     use crate::event::Kind;
+    use crate::metrics::Histogram;
 
     fn ev(device: &str, kind: Kind) -> Event {
         Event { device_id: device.into(), room_id: "room_000".into(), ts_ms: 1_000, seq: 1, kind }
@@ -348,17 +359,17 @@ mod tests {
 
     #[tokio::test]
     async fn full_lane_times_out_with_overloaded() {
-        let (ingest, _lanes) = lanes(&cfg(1, 50)); // nothing draining the lanes
+        let (ingest, _lanes) = lanes(&cfg(1, 50), Arc::default()); // nothing draining the lanes
         let i2 = ingest.clone();
-        let first = tokio::spawn(async move { i2.submit(vec![ev("a", Kind::Heartbeat)], 0).await });
+        let first = tokio::spawn(async move { i2.submit(vec![ev("a", Kind::Heartbeat)], 0, Instant::now()).await });
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(ingest.lane_depths(), (0, 1));
-        let r = ingest.submit(vec![ev("b", Kind::Heartbeat)], 0).await;
+        let r = ingest.submit(vec![ev("b", Kind::Heartbeat)], 0, Instant::now()).await;
         assert_eq!(r, Err(IngestError::Overloaded));
-        assert_eq!(ingest.stats.shed_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(ingest.metrics.requests_shed.load(Ordering::Relaxed), 1);
         // The fall lane is separate: a fall can still be queued.
         let i3 = ingest.clone();
-        tokio::spawn(async move { i3.submit(vec![ev("c", Kind::FallWarn { confidence: 0.9 })], 0).await });
+        tokio::spawn(async move { i3.submit(vec![ev("c", Kind::FallWarn { confidence: 0.9 })], 0, Instant::now()).await });
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(ingest.lane_depths(), (1, 1));
         first.abort();
@@ -368,21 +379,21 @@ mod tests {
     async fn falls_are_written_before_queued_bulk() {
         let tmp = tempfile::tempdir().unwrap();
         let config = cfg(1000, 1000);
-        let (ingest, lanes) = lanes(&config);
+        let (ingest, lanes) = lanes(&config, Arc::default());
         // Queue bulk first, then a fall, while nothing is draining.
         let mut tasks = Vec::new();
         for i in 0..5 {
             let ing = ingest.clone();
-            tasks.push(tokio::spawn(async move { ing.submit(vec![ev(&format!("hb{i}"), Kind::Heartbeat)], 0).await }));
+            tasks.push(tokio::spawn(async move { ing.submit(vec![ev(&format!("hb{i}"), Kind::Heartbeat)], 0, Instant::now()).await }));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
         let ing = ingest.clone();
-        tasks.push(tokio::spawn(async move { ing.submit(vec![ev("faller", Kind::FallWarn { confidence: 0.9 })], 0).await }));
+        tasks.push(tokio::spawn(async move { ing.submit(vec![ev("faller", Kind::FallWarn { confidence: 0.9 })], 0, Instant::now()).await }));
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let (wal, _) = Wal::open(tmp.path()).unwrap();
         let state = Arc::new(RwLock::new(State::new(0)));
-        let pipeline = start(lanes, wal, state.clone(), ingest.stats.clone(), watch::channel(0).0, &config);
+        let pipeline = start(lanes, wal, state.clone(), ingest.metrics.clone(), watch::channel(0).0, &config);
         for t in tasks {
             t.await.unwrap().unwrap();
         }
@@ -400,17 +411,20 @@ mod tests {
     async fn submit_returns_after_apply_and_shutdown_drains() {
         let tmp = tempfile::tempdir().unwrap();
         let config = Config { fsync: FsyncPolicy::Batch, ..cfg(1000, 1000) };
-        let (ingest, lanes) = lanes(&config);
+        let (ingest, lanes) = lanes(&config, Arc::default());
         let (wal, _) = Wal::open(tmp.path()).unwrap();
         let state = Arc::new(RwLock::new(State::new(0)));
-        let pipeline = start(lanes, wal, state.clone(), ingest.stats.clone(), watch::channel(0).0, &config);
+        let pipeline = start(lanes, wal, state.clone(), ingest.metrics.clone(), watch::channel(0).0, &config);
 
         let mixed = vec![ev("a", Kind::Heartbeat), ev("a", Kind::FallWarn { confidence: 0.9 }), ev("b", Kind::Heartbeat)];
-        ingest.submit(mixed, 0).await.unwrap();
+        ingest.submit(mixed, 0, Instant::now()).await.unwrap();
         assert_eq!(state.read().stats.applied, 3, "visible as soon as submit returns");
-        assert!(ingest.stats.fsyncs.load(Ordering::Relaxed) >= 1);
+        assert!(ingest.metrics.wal_fsyncs.load(Ordering::Relaxed) >= 1);
+        assert_eq!(ingest.metrics.accepted_total(), 3);
+        assert_eq!(ingest.metrics.alarms.load(Ordering::Relaxed), 1);
+        assert!(Histogram::quantile(&ingest.metrics.alarm_emit.counts(), 1.0).is_some());
 
         pipeline.shutdown();
-        assert_eq!(ingest.submit(vec![ev("c", Kind::Heartbeat)], 0).await, Err(IngestError::ShuttingDown));
+        assert_eq!(ingest.submit(vec![ev("c", Kind::Heartbeat)], 0, Instant::now()).await, Err(IngestError::ShuttingDown));
     }
 }

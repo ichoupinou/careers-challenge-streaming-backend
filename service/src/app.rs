@@ -13,6 +13,7 @@ use crate::api::AppState;
 use crate::clock::Clock;
 use crate::config::Config;
 use crate::ingest::{self, Pipeline};
+use crate::metrics::Metrics;
 use crate::snapshot::{self, Snapshotter};
 use crate::state::State;
 use crate::wal::{self, Wal, SEGMENT_BYTES};
@@ -30,10 +31,31 @@ impl Service {
     /// final snapshot so the next start replays nothing.
     pub fn shutdown(self) {
         self.pipeline.shutdown();
-        match self.snapshotter.run_once() {
-            Ok(Some(info)) => tracing::info!(?info, "final snapshot written"),
-            Ok(None) => {}
-            Err(e) => tracing::error!(error = %e, "final snapshot failed"),
+        take_snapshot(&self.snapshotter, &self.app.metrics);
+    }
+}
+
+/// Run one snapshot, recording metrics and logging the outcome.
+pub fn take_snapshot(snapshotter: &Snapshotter, metrics: &Metrics) {
+    use std::sync::atomic::Ordering::Relaxed;
+    match snapshotter.run_once() {
+        Ok(Some(info)) => {
+            metrics.snapshots.fetch_add(1, Relaxed);
+            metrics.snapshot.observe(std::time::Duration::from_millis(info.millis));
+            metrics.snapshot_bytes.store(info.bytes, Relaxed);
+            metrics.snapshot_offset.store(info.last_offset, Relaxed);
+            tracing::info!(
+                last_offset = info.last_offset,
+                bytes = info.bytes,
+                millis = info.millis,
+                wal_segments_deleted = info.wal_segments_deleted,
+                "snapshot written"
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            metrics.snapshot_failures.fetch_add(1, Relaxed);
+            tracing::error!(error = %e, "snapshot failed");
         }
     }
 }
@@ -101,12 +123,19 @@ pub fn start(config: Config, clock: Arc<dyn Clock>) -> io::Result<Service> {
         "recovered"
     );
 
+    let metrics = Arc::new(Metrics::default());
+    metrics.recovery_replayed.store(report.replayed, Ordering::Relaxed);
+    metrics.recovery_ms.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    if let Some(off) = report.snapshot_offset {
+        metrics.snapshot_offset.store(off, Ordering::Relaxed);
+    }
+
     let (snap_dir, wal_dir) = dirs(&config.data_dir);
     let state = Arc::new(RwLock::new(state));
     let snapshotter = Arc::new(Snapshotter::new(snap_dir, wal_dir, state.clone()));
     let (alarm_tx, alarm_rx) = watch::channel(state.read().alarms().last_id());
-    let (ingest, lanes) = ingest::lanes(&config);
-    let pipeline = ingest::start(lanes, wal, state.clone(), ingest.stats.clone(), alarm_tx, &config);
+    let (ingest, lanes) = ingest::lanes(&config, metrics.clone());
+    let pipeline = ingest::start(lanes, wal, state.clone(), metrics.clone(), alarm_tx, &config);
     let app = Arc::new(AppState {
         config,
         clock,
@@ -115,6 +144,7 @@ pub fn start(config: Config, clock: Arc<dyn Clock>) -> io::Result<Service> {
         ingest,
         alarm_rx,
         closing: watch::channel(false).0,
+        metrics,
     });
     app.ready.store(true, Ordering::Release);
     Ok(Service { app, pipeline, snapshotter })

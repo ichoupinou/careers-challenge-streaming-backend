@@ -32,16 +32,23 @@ pub enum Kind {
     NetStatus { rssi: i32 },
 }
 
+/// Event type names, indexed by `Kind::index`.
+pub const KIND_NAMES: [&str; 6] = ["heartbeat", "presence", "motion", "sleep_state", "fall_warn", "net_status"];
+
 impl Kind {
-    pub fn name(&self) -> &'static str {
+    pub fn index(&self) -> usize {
         match self {
-            Kind::Heartbeat => "heartbeat",
-            Kind::Presence { .. } => "presence",
-            Kind::Motion { .. } => "motion",
-            Kind::SleepState { .. } => "sleep_state",
-            Kind::FallWarn { .. } => "fall_warn",
-            Kind::NetStatus { .. } => "net_status",
+            Kind::Heartbeat => 0,
+            Kind::Presence { .. } => 1,
+            Kind::Motion { .. } => 2,
+            Kind::SleepState { .. } => 3,
+            Kind::FallWarn { .. } => 4,
+            Kind::NetStatus { .. } => 5,
         }
+    }
+
+    pub fn name(&self) -> &'static str {
+        KIND_NAMES[self.index()]
     }
 
     pub fn is_fall(&self) -> bool {

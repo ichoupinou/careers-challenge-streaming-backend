@@ -85,6 +85,11 @@ impl Wal {
         Ok((wal, report))
     }
 
+    /// Bytes written by the most recent `append`.
+    pub fn last_append_bytes(&self) -> u64 {
+        self.buf.len() as u64
+    }
+
     pub fn next_offset(&self) -> u64 {
         self.next_offset
     }

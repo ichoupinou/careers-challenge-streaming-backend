@@ -331,3 +331,35 @@ async fn shutdown_ends_open_streams() {
     let end = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame()).await.expect("stream ends");
     assert!(end.is_none());
 }
+
+#[tokio::test]
+async fn metrics_reflect_traffic() {
+    let app = app();
+    let f = fall("dev_0001", "room_000", "2026-05-23T18:53:40.000Z");
+    call_on(&app, post_req(f.clone())).await;
+    call_on(&app, post_req(f)).await; // jitter copy
+    call_on(&app, post_req(hb("2026-05-23T18:53:49.000Z"))).await;
+    call_on(&app, post_req(hb("2030-01-01T00:00:00.000Z"))).await; // rejected
+    call_on(&app, Request::post("/events").body(Body::from("{oops")).unwrap()).await;
+    let _sub = open_stream(&app, "/alarms/stream", None).await;
+
+    let resp = app.router.clone().oneshot(get_req("/metrics")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers()["content-type"].to_str().unwrap().starts_with("text/plain"));
+    let text = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    for line in [
+        "events_accepted_total{type=\"fall_warn\"} 2",
+        "events_accepted_total{type=\"heartbeat\"} 1",
+        "events_rejected_total{reason=\"ts_future\"} 1",
+        "events_rejected_total{reason=\"invalid_json\"} 1",
+        "alarms_total 1",
+        "falls_deduped_total 1",
+        "alarm_emit_latency_seconds_count 1",
+        "ingest_ack_seconds_count 3",
+        "alarm_feed_subscribers 1",
+        "wal_last_offset 3",
+        "devices 1",
+    ] {
+        assert!(text.contains(line), "missing {line:?} in:\n{text}");
+    }
+}

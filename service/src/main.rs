@@ -4,6 +4,7 @@ use std::sync::Arc;
 use stream_service::{api, app};
 use stream_service::clock::SystemClock;
 use stream_service::config::Config;
+use stream_service::metrics::StatsLogger;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -16,19 +17,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = service.app.clone();
 
     let snapshotter = service.snapshotter.clone();
+    let snap_metrics = service.app.metrics.clone();
     let every = config.snapshot_interval;
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(every);
         tick.tick().await; // skip the immediate first tick
         loop {
             tick.tick().await;
-            let s = snapshotter.clone();
-            match tokio::task::spawn_blocking(move || s.run_once()).await {
-                Ok(Ok(Some(info))) => tracing::info!(?info, "snapshot written"),
-                Ok(Ok(None)) => {}
-                Ok(Err(e)) => tracing::error!(error = %e, "snapshot failed"),
-                Err(e) => tracing::error!(error = %e, "snapshot task panicked"),
+            let (s, m) = (snapshotter.clone(), snap_metrics.clone());
+            if let Err(e) = tokio::task::spawn_blocking(move || app::take_snapshot(&s, &m)).await {
+                tracing::error!(error = %e, "snapshot task panicked");
             }
+        }
+    });
+
+    // One summary line every 10s: rates, latencies, queue depths.
+    let stats_app = state.clone();
+    tokio::spawn(async move {
+        let mut logger = StatsLogger::new(&stats_app.metrics);
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            logger.log(&stats_app.metrics, &stats_app.gauges());
         }
     });
 

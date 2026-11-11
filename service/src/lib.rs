@@ -12,5 +12,6 @@ pub mod config;
 pub mod event;
 pub mod snapshot;
 pub mod ingest;
+pub mod metrics;
 pub mod state;
 pub mod wal;
