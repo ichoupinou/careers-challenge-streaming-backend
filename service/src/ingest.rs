@@ -21,7 +21,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::clock::Millis;
 use crate::config::{Config, FsyncPolicy};
@@ -161,8 +161,16 @@ struct Batch {
     acks: Vec<Ack>,
 }
 
-/// Spawn the writer and applier threads.
-pub fn start(lanes: Lanes, wal: Wal, state: Arc<RwLock<State>>, stats: Arc<IngestStats>, config: &Config) -> Pipeline {
+/// Spawn the writer and applier threads. `alarm_tx` is bumped to the
+/// newest `alarm_id` whenever the applier emits alarms (the live feed).
+pub fn start(
+    lanes: Lanes,
+    wal: Wal,
+    state: Arc<RwLock<State>>,
+    stats: Arc<IngestStats>,
+    alarm_tx: watch::Sender<u64>,
+    config: &Config,
+) -> Pipeline {
     let (apply_tx, apply_rx) = std::sync::mpsc::sync_channel::<Batch>(APPLY_QUEUE);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -178,7 +186,7 @@ pub fn start(lanes: Lanes, wal: Wal, state: Arc<RwLock<State>>, stats: Arc<Inges
 
     let applier = std::thread::Builder::new()
         .name("applier".into())
-        .spawn(move || applier_loop(apply_rx, state, stats))
+        .spawn(move || applier_loop(apply_rx, state, stats, alarm_tx))
         .expect("spawn applier");
 
     Pipeline { shutdown: Some(shutdown_tx), writer: Some(writer), applier: Some(applier) }
@@ -296,7 +304,7 @@ fn sync(wal: &mut Wal, stats: &IngestStats) {
     }
 }
 
-fn applier_loop(rx: std::sync::mpsc::Receiver<Batch>, state: Arc<RwLock<State>>, stats: Arc<IngestStats>) {
+fn applier_loop(rx: std::sync::mpsc::Receiver<Batch>, state: Arc<RwLock<State>>, stats: Arc<IngestStats>, alarm_tx: watch::Sender<u64>) {
     while let Ok(batch) = rx.recv() {
         let mut alarms = Vec::new();
         {
@@ -315,7 +323,10 @@ fn applier_loop(rx: std::sync::mpsc::Receiver<Batch>, state: Arc<RwLock<State>>,
             stats.alarm_latency_us_max.fetch_max(us, Ordering::Relaxed);
             tracing::debug!(alarm_id = a.alarm_id, room = %a.room_id, device = %a.device_id, "alarm");
         }
-        // TODO(milestone 5): publish `alarms` to the live feed.
+        // Wake feed subscribers; they read the new alarms from the store.
+        if let Some(last) = alarms.last() {
+            alarm_tx.send_replace(last.alarm_id);
+        }
         for ack in batch.acks {
             let _ = ack.send(Ok(()));
         }
@@ -371,7 +382,7 @@ mod tests {
 
         let (wal, _) = Wal::open(tmp.path()).unwrap();
         let state = Arc::new(RwLock::new(State::new(0)));
-        let pipeline = start(lanes, wal, state.clone(), ingest.stats.clone(), &config);
+        let pipeline = start(lanes, wal, state.clone(), ingest.stats.clone(), watch::channel(0).0, &config);
         for t in tasks {
             t.await.unwrap().unwrap();
         }
@@ -392,7 +403,7 @@ mod tests {
         let (ingest, lanes) = lanes(&config);
         let (wal, _) = Wal::open(tmp.path()).unwrap();
         let state = Arc::new(RwLock::new(State::new(0)));
-        let pipeline = start(lanes, wal, state.clone(), ingest.stats.clone(), &config);
+        let pipeline = start(lanes, wal, state.clone(), ingest.stats.clone(), watch::channel(0).0, &config);
 
         let mixed = vec![ev("a", Kind::Heartbeat), ev("a", Kind::FallWarn { confidence: 0.9 }), ev("b", Kind::Heartbeat)];
         ingest.submit(mixed, 0).await.unwrap();

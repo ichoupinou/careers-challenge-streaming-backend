@@ -945,6 +945,7 @@ dependencies = [
  "axum",
  "chrono",
  "crc32fast",
+ "futures-util",
  "http-body-util",
  "parking_lot",
  "postcard",

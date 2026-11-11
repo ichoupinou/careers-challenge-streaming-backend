@@ -5,11 +5,14 @@
 //! short read lock on the materialized state.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -22,7 +25,9 @@ use crate::event::{self, Event, Reject};
 use crate::ingest::{Ingest, IngestError};
 use crate::state::alarms::Alarm;
 use crate::state::State as Materialized;
+use futures_util::{Stream, StreamExt};
 use parking_lot::RwLock;
+use tokio::sync::watch;
 
 /// Longest occupancy window we retain history for.
 pub const MAX_WINDOW_SECS: u32 = 3600;
@@ -35,12 +40,21 @@ pub struct AppState {
     /// Written only by the applier thread.
     pub state: Arc<RwLock<Materialized>>,
     pub ingest: Ingest,
+    /// Newest `alarm_id`, bumped by the applier: wakes feed subscribers.
+    pub alarm_rx: watch::Receiver<u64>,
+    /// Set on shutdown so open SSE streams end and graceful shutdown completes.
+    pub closing: watch::Sender<bool>,
 }
 
 impl AppState {
     /// Submit validated events and map pipeline failures to HTTP errors.
     async fn submit(&self, events: Vec<Event>, recv_ms: Millis) -> Result<(), ApiError> {
         self.ingest.submit(events, recv_ms).await.map_err(ApiError::from)
+    }
+
+    /// Close live feeds (call when the server starts shutting down).
+    pub fn begin_shutdown(&self) {
+        self.closing.send_replace(true);
     }
 
     /// Periodic housekeeping: drop history no read can need any more.
@@ -57,6 +71,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/devices/{device_id}/health", get(device_health))
         .route("/rooms/{room_id}/occupancy", get(room_occupancy))
         .route("/alarms", get(alarms))
+        .route("/alarms/stream", get(alarm_stream))
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(readyz))
         .with_state(state)
@@ -234,27 +249,127 @@ struct AlarmsQuery {
     since: Option<String>,
     /// Page size. Unbounded by default: the eval reads `since=0` in one go.
     limit: Option<usize>,
+    /// Only alarms for this room.
+    room_id: Option<String>,
+    /// Long-poll: if nothing matches yet, wait up to this many seconds
+    /// (max 60) for a new alarm before answering.
+    wait: Option<f64>,
 }
 
-/// `GET /alarms?since=<alarm_id|RFC 3339 ts>&limit=<n>`, in emission order.
-/// `next_cursor` is the last returned `alarm_id` (pass it back as `since`).
-async fn alarms(State(st): State<Arc<AppState>>, Query(q): Query<AlarmsQuery>) -> ApiResult {
-    let since = parse_since(q.since.as_deref())?;
-    let limit = q.limit.unwrap_or(usize::MAX);
+/// Longest long-poll a client can ask for.
+pub const MAX_WAIT_SECS: f64 = 60.0;
+
+/// One page of alarms after `since` (optionally for one room), and the
+/// cursor to resume from. Alarms come in `alarm_id` order, which is
+/// emission order, so they're also in order per room.
+fn read_alarms(st: &AppState, since: Since, room: Option<&str>, limit: usize) -> (Vec<Value>, u64) {
     let state = st.state.read();
     let store = state.alarms();
+    let in_room = |a: &&Alarm| room.is_none_or(|r| a.room_id == r);
     let items: Vec<Value> = match since {
-        Since::Cursor(c) => store.after(c, limit).map(alarm_json).collect(),
-        Since::Ts(t) => store.since_ts(t, limit).map(alarm_json).collect(),
+        Since::Cursor(c) => store.after(c, usize::MAX).filter(in_room).take(limit).map(alarm_json).collect(),
+        Since::Ts(t) => store.since_ts(t, usize::MAX).filter(in_room).take(limit).map(alarm_json).collect(),
     };
-    let next_cursor = items
-        .last()
-        .and_then(|a| a["alarm_id"].as_u64())
-        .unwrap_or(match since {
-            Since::Cursor(c) => c,
-            Since::Ts(_) => store.last_id(),
-        });
-    Ok(Json(json!({ "alarms": items, "next_cursor": next_cursor })).into_response())
+    let next_cursor = if items.len() == limit {
+        items.last().and_then(|a| a["alarm_id"].as_u64()).unwrap_or(0)
+    } else {
+        // Everything up to the newest alarm has been scanned.
+        let floor = if let Since::Cursor(c) = since { c } else { 0 };
+        store.last_id().max(floor)
+    };
+    (items, next_cursor)
+}
+
+/// `GET /alarms?since=<alarm_id|RFC 3339 ts>&limit=<n>&room_id=<r>&wait=<s>`.
+/// Alarms come in emission order. `next_cursor` is where to resume: pass it
+/// back as `since`. With `wait`, an empty result is held open until a new
+/// alarm arrives or the wait ends.
+async fn alarms(State(st): State<Arc<AppState>>, Query(q): Query<AlarmsQuery>) -> ApiResult {
+    let since = parse_since(q.since.as_deref())?;
+    let limit = q.limit.unwrap_or(usize::MAX).max(1);
+    let wait = q.wait.filter(|w| w.is_finite() && *w > 0.0).map(|w| Duration::from_secs_f64(w.min(MAX_WAIT_SECS)));
+    let deadline = wait.map(|w| tokio::time::Instant::now() + w);
+    let mut rx = st.alarm_rx.clone();
+    loop {
+        // Mark the current version as seen *before* reading, so an alarm
+        // published after the read still wakes us.
+        rx.borrow_and_update();
+        let (items, next_cursor) = read_alarms(&st, since, q.room_id.as_deref(), limit);
+        let Some(deadline) = deadline.filter(|_| items.is_empty()) else {
+            return Ok(Json(json!({ "alarms": items, "next_cursor": next_cursor })).into_response());
+        };
+        match tokio::time::timeout_at(deadline, rx.changed()).await {
+            Ok(Ok(())) => continue,
+            // Timed out or shutting down: answer with the empty page.
+            _ => return Ok(Json(json!({ "alarms": items, "next_cursor": next_cursor })).into_response()),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct StreamQuery {
+    since: Option<u64>,
+    room_id: Option<String>,
+}
+
+struct StreamState {
+    app: Arc<AppState>,
+    cursor: u64,
+    room: Option<String>,
+    alarms: watch::Receiver<u64>,
+    closing: watch::Receiver<bool>,
+}
+
+/// `GET /alarms/stream?since=<alarm_id>&room_id=<r>`: Server-Sent Events.
+///
+/// Each alarm is an `event: alarm` whose `id:` is its `alarm_id`. A client
+/// that reconnects with `Last-Event-ID` (browsers do this automatically)
+/// or `?since=` first gets every alarm after that id from the store, then
+/// live ones. The store is the source of truth, so a slow or reconnecting
+/// subscriber can't miss an alarm, including across a service restart.
+async fn alarm_stream(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<StreamQuery>,
+) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
+    let cursor = match headers.get("last-event-id") {
+        Some(v) => v
+            .to_str()
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .ok_or_else(|| ApiError::bad_request("bad_last_event_id", "Last-Event-ID must be an alarm_id"))?,
+        None => q.since.unwrap_or(0),
+    };
+    let s = StreamState {
+        cursor,
+        room: q.room_id,
+        alarms: st.alarm_rx.clone(),
+        closing: st.closing.subscribe(),
+        app: st,
+    };
+    let stream = futures_util::stream::unfold(s, |mut s| async move {
+        loop {
+            if *s.closing.borrow() {
+                return None;
+            }
+            s.alarms.borrow_and_update();
+            let (items, next) = read_alarms(&s.app, Since::Cursor(s.cursor), s.room.as_deref(), 1_000);
+            s.cursor = next;
+            if !items.is_empty() {
+                let events: Vec<Result<SseEvent, Infallible>> = items
+                    .iter()
+                    .map(|a| Ok(SseEvent::default().event("alarm").id(a["alarm_id"].to_string()).data(a.to_string())))
+                    .collect();
+                return Some((futures_util::stream::iter(events), s));
+            }
+            tokio::select! {
+                changed = s.alarms.changed() => if changed.is_err() { return None },
+                _ = s.closing.changed() => return None,
+            }
+        }
+    })
+    .flatten();
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 pub fn alarm_json(a: &Alarm) -> Value {

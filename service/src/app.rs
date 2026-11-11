@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::RwLock;
+use tokio::sync::watch;
 
 use crate::api::AppState;
 use crate::clock::Clock;
@@ -103,9 +104,18 @@ pub fn start(config: Config, clock: Arc<dyn Clock>) -> io::Result<Service> {
     let (snap_dir, wal_dir) = dirs(&config.data_dir);
     let state = Arc::new(RwLock::new(state));
     let snapshotter = Arc::new(Snapshotter::new(snap_dir, wal_dir, state.clone()));
+    let (alarm_tx, alarm_rx) = watch::channel(state.read().alarms().last_id());
     let (ingest, lanes) = ingest::lanes(&config);
-    let pipeline = ingest::start(lanes, wal, state.clone(), ingest.stats.clone(), &config);
-    let app = Arc::new(AppState { config, clock, ready: AtomicBool::new(false), state, ingest });
+    let pipeline = ingest::start(lanes, wal, state.clone(), ingest.stats.clone(), alarm_tx, &config);
+    let app = Arc::new(AppState {
+        config,
+        clock,
+        ready: AtomicBool::new(false),
+        state,
+        ingest,
+        alarm_rx,
+        closing: watch::channel(false).0,
+    });
     app.ready.store(true, Ordering::Release);
     Ok(Service { app, pipeline, snapshotter })
 }

@@ -44,8 +44,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "listening");
+    let closer = state.clone();
     axum::serve(listener, api::router(state))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            // End open SSE streams so in-flight connections can finish.
+            closer.begin_shutdown();
+        })
         .await?;
     // Drain queued events into the WAL, fsync, and write a final snapshot.
     tokio::task::spawn_blocking(move || service.shutdown()).await?;
