@@ -12,4 +12,4 @@ build/
 *.log
 .env
 .env.local
-data/snapshots/
+data/
