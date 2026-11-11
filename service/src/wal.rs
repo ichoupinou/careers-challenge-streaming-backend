@@ -55,10 +55,13 @@ impl Wal {
     /// Open `dir` for appending after the last valid record. Truncates a torn
     /// tail and always starts a fresh segment.
     pub fn open(dir: impl Into<PathBuf>) -> io::Result<(Self, OpenReport)> {
-        Self::open_with_limit(dir, SEGMENT_BYTES)
+        Self::open_with(dir, SEGMENT_BYTES, 0)
     }
 
-    pub fn open_with_limit(dir: impl Into<PathBuf>, segment_limit: u64) -> io::Result<(Self, OpenReport)> {
+    /// Like `open`, but never hands out offsets `<= min_last_offset`. A
+    /// snapshot can be ahead of the WAL if un-fsynced WAL data was lost in an
+    /// OS crash; continuing from the snapshot keeps offsets unique.
+    pub fn open_with(dir: impl Into<PathBuf>, segment_limit: u64, min_last_offset: u64) -> io::Result<(Self, OpenReport)> {
         let dir = dir.into();
         fs::create_dir_all(&dir)?;
         let segments = list_segments(&dir)?;
@@ -76,7 +79,7 @@ impl Wal {
             report.last_offset = scan.last_offset.unwrap_or(segment_start(last).saturating_sub(1));
         }
 
-        let next_offset = report.last_offset + 1;
+        let next_offset = report.last_offset.max(min_last_offset) + 1;
         let file = create_segment(&dir, next_offset)?;
         let wal = Self { dir, file, segment_bytes: 0, segment_limit, next_offset, buf: Vec::with_capacity(1 << 20) };
         Ok((wal, report))
@@ -197,6 +200,23 @@ fn scan_segment(path: &Path, mut f: impl FnMut(WalRecord) -> io::Result<()>) -> 
     Ok(Scan { valid_bytes: pos as u64, last_offset, torn: pos < data.len() })
 }
 
+/// Delete segments whose records all have `offset <= upto`. The newest
+/// segment is never deleted. Returns how many were removed.
+pub fn gc(dir: &Path, upto: u64) -> io::Result<usize> {
+    let segments = list_segments(dir)?;
+    let mut removed = 0;
+    for pair in segments.windows(2) {
+        // Records in pair[0] are all < start of pair[1].
+        if segment_start(&pair[1]) <= upto + 1 {
+            fs::remove_file(&pair[0])?;
+            removed += 1;
+        } else {
+            break;
+        }
+    }
+    Ok(removed)
+}
+
 /// Replay every valid record with `offset > after`, oldest first. Returns
 /// the number of records passed to `f`.
 pub fn replay(dir: &Path, after: u64, mut f: impl FnMut(WalRecord)) -> io::Result<u64> {
@@ -265,13 +285,13 @@ mod tests {
     fn reopen_continues_offsets_and_rotates() {
         let tmp = tempfile::tempdir().unwrap();
         {
-            let (mut wal, _) = Wal::open_with_limit(tmp.path(), 256).unwrap();
+            let (mut wal, _) = Wal::open_with(tmp.path(), 256, 0).unwrap();
             for i in 1..=20 {
                 wal.append([ev(i)]).unwrap();
             }
         }
         assert!(list_segments(tmp.path()).unwrap().len() > 2, "rotated");
-        let (mut wal, rep) = Wal::open_with_limit(tmp.path(), 256).unwrap();
+        let (mut wal, rep) = Wal::open_with(tmp.path(), 256, 0).unwrap();
         assert_eq!(rep.last_offset, 20);
         assert_eq!(wal.append([ev(21)]).unwrap()[0].offset, 21);
         let offsets: Vec<u64> = read_all(tmp.path()).iter().map(|r| r.offset).collect();
@@ -280,6 +300,37 @@ mod tests {
         let mut tail = Vec::new();
         replay(tmp.path(), 17, |r| tail.push(r.offset)).unwrap();
         assert_eq!(tail, [18, 19, 20, 21], "segment skipping keeps the tail exact");
+    }
+
+    #[test]
+    fn gc_removes_only_fully_covered_segments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut wal, _) = Wal::open_with(tmp.path(), 256, 0).unwrap();
+        for i in 1..=20 {
+            wal.append([ev(i)]).unwrap();
+        }
+        let before = list_segments(tmp.path()).unwrap().len();
+        let removed = gc(tmp.path(), 12).unwrap();
+        assert!(removed > 0 && removed < before);
+        // Everything after 12 is still replayable.
+        let mut tail = Vec::new();
+        replay(tmp.path(), 12, |r| tail.push(r.offset)).unwrap();
+        assert_eq!(tail, (13..=20).collect::<Vec<_>>());
+        // GC past the end keeps the newest segment.
+        gc(tmp.path(), 1_000).unwrap();
+        assert_eq!(list_segments(tmp.path()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn open_respects_offset_floor() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let (mut wal, _) = Wal::open(tmp.path()).unwrap();
+            wal.append((1..=3).map(ev)).unwrap();
+        }
+        let (mut wal, rep) = Wal::open_with(tmp.path(), SEGMENT_BYTES, 10).unwrap();
+        assert_eq!(rep.last_offset, 3);
+        assert_eq!(wal.append([ev(4)]).unwrap()[0].offset, 11);
     }
 
     #[test]

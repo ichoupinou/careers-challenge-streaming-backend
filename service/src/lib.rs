@@ -10,6 +10,7 @@ pub mod app;
 pub mod clock;
 pub mod config;
 pub mod event;
+pub mod snapshot;
 pub mod ingest;
 pub mod state;
 pub mod wal;

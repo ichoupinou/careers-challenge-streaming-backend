@@ -77,6 +77,11 @@ impl State {
         }
     }
 
+    /// Config wins over whatever window a restored snapshot carried.
+    pub fn set_dedup_window(&mut self, window_ms: Millis) {
+        self.falls.set_window(window_ms);
+    }
+
     pub fn apply(&mut self, ev: &Event, offset: u64, recv_ms: Millis) -> Applied {
         self.last_offset = offset;
         self.stats.applied += 1;

@@ -26,6 +26,12 @@ impl FallDedup {
         Self { window_ms: window_ms.max(0), accepted: HashMap::new() }
     }
 
+    /// Change the window (e.g. config changed since the snapshot was taken).
+    /// Applies to falls seen from now on.
+    pub fn set_window(&mut self, window_ms: Millis) {
+        self.window_ms = window_ms.max(0);
+    }
+
     pub fn window_ms(&self) -> Millis {
         self.window_ms
     }

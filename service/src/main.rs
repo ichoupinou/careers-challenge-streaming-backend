@@ -12,7 +12,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing(config.log_json);
     tracing::info!(?config, "starting");
 
-    let app::Service { app: state, pipeline } = app::start(config.clone(), Arc::new(SystemClock))?;
+    let service = app::start(config.clone(), Arc::new(SystemClock))?;
+    let state = service.app.clone();
+
+    let snapshotter = service.snapshotter.clone();
+    let every = config.snapshot_interval;
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.tick().await; // skip the immediate first tick
+        loop {
+            tick.tick().await;
+            let s = snapshotter.clone();
+            match tokio::task::spawn_blocking(move || s.run_once()).await {
+                Ok(Ok(Some(info))) => tracing::info!(?info, "snapshot written"),
+                Ok(Ok(None)) => {}
+                Ok(Err(e)) => tracing::error!(error = %e, "snapshot failed"),
+                Err(e) => tracing::error!(error = %e, "snapshot task panicked"),
+            }
+        }
+    });
 
     let housekeeping = state.clone();
     tokio::spawn(async move {
@@ -29,8 +47,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, api::router(state))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
-    // Drain queued events into the WAL and fsync before exiting.
-    tokio::task::spawn_blocking(move || pipeline.shutdown()).await?;
+    // Drain queued events into the WAL, fsync, and write a final snapshot.
+    tokio::task::spawn_blocking(move || service.shutdown()).await?;
     tracing::info!("stopped");
     Ok(())
 }
